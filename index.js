@@ -13,6 +13,8 @@ const app = express();
 const server = http.createServer(app);
 const { pipeline } = require("stream/promises");
 
+const MAX_FILE_BYTES = parseFileSize(process.env.MAX_FILE_SIZE) || Infinity;
+
 server.requestTimeout = 0;
 server.keepAliveTimeout = 65_000;
 server.headersTimeout = 66_000;
