@@ -8,7 +8,8 @@ const { v4: uuidv4 } = require("uuid");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
-// require("dotenv").config();
+require("dotenv").config();
+
 const app = express();
 const server = http.createServer(app);
 const { pipeline } = require("stream/promises");
@@ -347,6 +348,28 @@ function parseFileSize(sizeStr) {
 
   const [, value, unit] = match;
   return Number(value) * units[unit];
+}
+
+function getUniqueFileName(room, uploaderId, originalName) {
+  const taken = new Set(
+    (room.files || [])
+      .filter((f) => String(f.uploaderId) === String(uploaderId))
+      .map((f) => f.fileName.toLowerCase()),
+  );
+
+  if (!taken.has(originalName.toLowerCase())) return originalName;
+
+  const ext = path.extname(originalName);
+  const base = path.basename(originalName, ext);
+
+  let n = 1;
+  let candidate;
+  do {
+    candidate = `${base} (${n})${ext}`;
+    n++;
+  } while (taken.has(candidate.toLowerCase()));
+
+  return candidate;
 }
 
 // ─── Multer ───────────────────────────────────────────────
@@ -736,6 +759,15 @@ app.post("/api/rooms/my-room", (req, res) => {
   res.json({ success: true, room: getRoomPublicData(room) });
 });
 
+// ============================================================================
+// Server file mein REPLACE karo:
+//   `const UPLOAD_TMP_DIR = ...` se le kar
+//   `// 4) cancel` wale app.delete(...) route ke end tak
+// Baaqi file (REST /files route, sockets, etc.) waise hi rahegi.
+// Agar MAX_FILE_BYTES pehle se alag define kiya hai to us line ko hata dena
+// (do baar const declare hone par SyntaxError aayega).
+// ============================================================================
+
 const UPLOAD_TMP_DIR = path.join(DATA_DIR, "uploads-tmp");
 fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true });
 
@@ -750,7 +782,8 @@ const partPath = (id) => path.join(UPLOAD_TMP_DIR, `${id}.part`);
 const metaPath = (id) => path.join(UPLOAD_TMP_DIR, `${id}.json`);
 
 function persistSession(s) {
-  const { activeReq, fileEntry, ...data } = s;
+  // active (chunk requests), finalizing, fileEntry disk par save nahi hote
+  const { active, finalizing, fileEntry, ...data } = s;
   fs.promises
     .writeFile(metaPath(s.uploadId), JSON.stringify(data))
     .catch((e) => console.error("persistSession:", e.message));
@@ -759,9 +792,10 @@ function persistSession(s) {
 function sessionState(s) {
   return {
     uploadId: s.uploadId,
-    offset: s.offset,
     fileSize: s.fileSize,
-    chunkSize: DEFAULT_CHUNK_BYTES,
+    chunkSize: s.chunkSize,
+    totalChunks: s.totalChunks,
+    received: [...s.received], // jo chunk indexes server pe aa chuke hain
     complete: !!s.fileEntry,
     file: s.fileEntry || undefined,
   };
@@ -770,7 +804,7 @@ function sessionState(s) {
 function discardUpload(uploadId) {
   const s = uploadSessions.get(uploadId);
   if (!s) return;
-  s.activeReq?.destroy();
+  s.active?.forEach((r) => r.destroy());
   uploadSessions.delete(uploadId);
   fs.promises.unlink(partPath(uploadId)).catch(() => {});
   fs.promises.unlink(metaPath(uploadId)).catch(() => {});
@@ -795,7 +829,20 @@ function discardRoomUploads(roomId) {
         fs.unlinkSync(path.join(UPLOAD_TMP_DIR, f));
         continue;
       }
-      s.activeReq = null;
+
+      // Purane (sequential offset wale) sessions ko naye format mein badlo
+      if (!Array.isArray(s.received)) {
+        s.chunkSize = s.chunkSize || 2 * 1024 * 1024;
+        s.totalChunks = Math.ceil(s.fileSize / s.chunkSize);
+        const doneCount = Math.min(
+          Math.floor((s.offset || 0) / s.chunkSize),
+          s.totalChunks,
+        );
+        s.received = Array.from({ length: doneCount }, (_, i) => i);
+      }
+
+      s.active = new Map();
+      s.finalizing = false;
       uploadSessions.set(s.uploadId, s);
       metas.add(s.uploadId);
     } catch {
@@ -822,6 +869,30 @@ setInterval(
   60 * 60 * 1000,
 ).unref();
 
+// Windows-style unique naming: file.pdf -> file (1).pdf -> file (2).pdf
+// Sirf usi uploader ki files se compare hota hai, doosre users se nahi.
+function getUniqueFileName(room, uploaderId, originalName) {
+  const taken = new Set(
+    (room.files || [])
+      .filter((f) => !f.deleted && String(f.uploaderId) === String(uploaderId))
+      .map((f) => f.fileName.toLowerCase()),
+  );
+
+  if (!taken.has(originalName.toLowerCase())) return originalName;
+
+  const ext = path.extname(originalName);
+  const base = path.basename(originalName, ext);
+
+  let n = 1;
+  let candidate;
+  do {
+    candidate = `${base} (${n})${ext}`;
+    n++;
+  } while (taken.has(candidate.toLowerCase()));
+
+  return candidate;
+}
+
 async function finalizeUpload(s, room) {
   if (room.ended) throw new Error("Room ended");
   const stat = await fs.promises.stat(partPath(s.uploadId));
@@ -838,7 +909,7 @@ async function finalizeUpload(s, room) {
 
   const fileEntry = {
     id: path.basename(storedName, path.extname(storedName)),
-    fileName: s.fileName,
+    fileName: getUniqueFileName(room, s.uploaderId, s.fileName),
     fileType: s.fileType,
     fileSize: s.fileSize,
     storedName,
@@ -860,12 +931,26 @@ async function finalizeUpload(s, room) {
     file: fileEntry,
     room: getRoomPublicData(room),
   });
-  console.log(`File saved (resumable): ${s.fileName} in room ${room.id}`);
+  console.log(
+    `File saved (resumable): ${fileEntry.fileName} in room ${room.id}`,
+  );
   return fileEntry;
 }
 
-// 1) init (idempotent: same uploadId dobara aaye to current offset milta hai)
-app.post("/api/rooms/:roomId/uploads", (req, res) => {
+// Jab saare chunks aa jayen to ek hi baar finalize chale
+async function tryFinalize(s, room) {
+  if (s.fileEntry || s.finalizing) return;
+  if (s.received.length !== s.totalChunks) return;
+  s.finalizing = true;
+  try {
+    await finalizeUpload(s, room);
+  } finally {
+    s.finalizing = false;
+  }
+}
+
+// 1) init (idempotent: same uploadId dobara aaye to current state milti hai)
+app.post("/api/rooms/:roomId/uploads", async (req, res) => {
   const { roomId } = req.params;
   const room = rooms.get(roomId);
   if (!room || room.ended)
@@ -901,10 +986,21 @@ app.post("/api/rooms/:roomId/uploads", (req, res) => {
     existing.fileName === fileName &&
     existing.fileSize === size
   ) {
+    // Saare chunks aa chuke thay lekin finalize fail hua tha? Dobara try karo.
+    try {
+      await tryFinalize(existing, room);
+    } catch (e) {
+      console.error(
+        `[upload ${existing.uploadId}] finalize failed:`,
+        e.message,
+      );
+      return res.status(500).json({ error: "Failed to finalize upload" });
+    }
     return res.json(sessionState(existing));
   }
 
   const uploadId = requestedId && !existing ? requestedId : uuidv4();
+  const chunkSize = DEFAULT_CHUNK_BYTES;
   const s = {
     uploadId,
     roomId,
@@ -913,33 +1009,36 @@ app.post("/api/rooms/:roomId/uploads", (req, res) => {
     fileType: fileType || "application/octet-stream",
     uploaderId: uploaderId || "unknown",
     uploaderName: uploaderName || "Unknown",
-    offset: 0,
+    chunkSize,
+    totalChunks: Math.ceil(size / chunkSize),
+    received: [],
     createdAt: Date.now(),
     updatedAt: Date.now(),
-    activeReq: null,
+    active: new Map(), // chunkIndex -> chal rahi request
+    finalizing: false,
   };
+
+  // Poori file ki jagah pehle se bana lo, taake chunks kisi bhi order mein
+  // apni sahi position (offset) par likhe ja saken. Alag "merge" step nahi chahiye.
   fs.closeSync(fs.openSync(partPath(uploadId), "w"));
+  fs.truncateSync(partPath(uploadId), size);
+
   uploadSessions.set(uploadId, s);
   persistSession(s);
   res.status(201).json(sessionState(s));
 });
 
-// 2) status: client reconnect ke baad yahin se exact offset poochta hai
+// 2) status: client reconnect ke baad yahin se poochta hai kaun se chunks aa chuke hain
 app.get("/api/rooms/:roomId/uploads/:uploadId", (req, res) => {
   const s = uploadSessions.get(req.params.uploadId);
   if (!s || s.roomId !== req.params.roomId) {
     return res.status(404).json({ error: "Upload session not found" });
   }
   touchRoom(s.roomId);
-  console.log(
-    `[${s.fileName}] [Room: ${room.name} (${roomId})] ` +
-      `${(s.offset / 1048576).toFixed(2)} MB / ${(s.fileSize / 1048576).toFixed(2)} MB ` +
-      `(${Math.floor((s.offset / s.fileSize) * 100)}%)`,
-  );
   res.json(sessionState(s));
 });
 
-// 3) chunk
+// 3) chunk (kai chunks ek saath, kisi bhi order mein aa sakte hain)
 app.put("/api/rooms/:roomId/uploads/:uploadId", async (req, res) => {
   const { roomId, uploadId } = req.params;
   const room = rooms.get(roomId);
@@ -955,7 +1054,12 @@ app.put("/api/rooms/:roomId/uploads/:uploadId", async (req, res) => {
 
   const start = Number(req.headers["x-upload-offset"]);
   const len = Number(req.headers["content-length"]);
-  if (!Number.isInteger(start) || !Number.isInteger(len) || len <= 0) {
+  if (
+    !Number.isInteger(start) ||
+    start < 0 ||
+    !Number.isInteger(len) ||
+    len <= 0
+  ) {
     req.resume();
     return res
       .status(400)
@@ -965,21 +1069,39 @@ app.put("/api/rooms/:roomId/uploads/:uploadId", async (req, res) => {
     req.resume();
     return res.status(413).json({ error: "Chunk too large" });
   }
-  if (start !== s.offset) {
+  if (start % s.chunkSize !== 0 || start >= s.fileSize) {
     req.resume();
-    return res.status(409).json(sessionState(s));
-  }
-  if (start + len > s.fileSize) {
-    req.resume();
-    return res.status(400).json({ error: "Chunk exceeds file size" });
+    return res.status(400).json({ error: "Invalid chunk offset" });
   }
 
-  // Network drop ke baad purani request server pe "zinda" reh sakti hai (TCP timeout tak).
-  // Nayi request aaye to purani ko foran khatam karo. Dono same bytes same position pe
-  // likhte hain, is liye overlap se data kharab nahi hota.
-  if (s.activeReq && !s.activeReq.destroyed) s.activeReq.destroy();
-  s.activeReq = req;
+  const index = start / s.chunkSize;
+  const expectedLen = Math.min(s.chunkSize, s.fileSize - start);
+  if (len !== expectedLen) {
+    req.resume();
+    return res
+      .status(400)
+      .json({ error: `Invalid chunk size, expected ${expectedLen}` });
+  }
 
+  // Ye chunk pehle aa chuka hai (retry / duplicate): dobara likhne ki zaroorat nahi
+  if (s.received.includes(index)) {
+    req.resume();
+    try {
+      await tryFinalize(s, room);
+    } catch (e) {
+      console.error(`[upload ${uploadId}] finalize failed:`, e.message);
+      return res.status(500).json({ error: "Failed to finalize upload" });
+    }
+    return res.json(sessionState(s));
+  }
+
+  // Isi chunk ki purani adhoori request (network drop ke baad) ho to khatam karo.
+  // Dono same bytes same position pe likhte hain, is liye overlap se data kharab nahi hota.
+  const prev = s.active.get(index);
+  if (prev && !prev.destroyed) prev.destroy();
+  s.active.set(index, req);
+
+  // Har chunk file mein apni offset par likha jata hai (r+ flag, start = offset)
   const ws = fs.createWriteStream(partPath(uploadId), { flags: "r+", start });
   let written = 0;
   req.on("data", (c) => {
@@ -989,15 +1111,15 @@ app.put("/api/rooms/:roomId/uploads/:uploadId", async (req, res) => {
   try {
     await pipeline(req, ws);
   } catch (err) {
-    // Offset aage nahi barha. Client wahi chunk dobara bhejega.
+    // Chunk received mein add nahi hua. Client wahi chunk dobara bhejega.
     console.warn(
-      `[upload ${uploadId}] chunk @${start} interrupted at ${written}/${len} (${err.code || err.message})`,
+      `[upload ${uploadId}] chunk #${index} interrupted at ${written}/${len} (${err.code || err.message})`,
     );
-    if (s.activeReq === req) s.activeReq = null;
+    if (s.active.get(index) === req) s.active.delete(index);
     return;
   }
-  if (s.activeReq !== req) return; // koi nayi request isay replace kar chuki hai
-  s.activeReq = null;
+  if (s.active.get(index) !== req) return; // koi nayi request isay replace kar chuki hai
+  s.active.delete(index);
 
   if (written !== len) {
     return res
@@ -1005,34 +1127,23 @@ app.put("/api/rooms/:roomId/uploads/:uploadId", async (req, res) => {
       .json({ error: "Chunk size mismatch", ...sessionState(s) });
   }
 
-  s.offset = start + len;
+  if (!s.received.includes(index)) s.received.push(index);
   s.updatedAt = Date.now();
   touchRoom(roomId);
 
-  if (s.offset === s.fileSize) {
-    try {
-      await finalizeUpload(s, room);
-    } catch (e) {
-      console.error(`[upload ${uploadId}] finalize failed:`, e.message);
-      return res.status(500).json({ error: "Failed to finalize upload" });
-    }
-    return res.json(sessionState(s));
+  console.log(
+    `[${s.fileName}] [Room: ${room.name} (${roomId})] chunk ${s.received.length}/${s.totalChunks} ` +
+      `(${(Math.min(s.received.length * s.chunkSize, s.fileSize) / 1048576) | 0} / ${(s.fileSize / 1048576).toFixed(2)} MB)`,
+  );
+
+  try {
+    await tryFinalize(s, room);
+  } catch (e) {
+    console.error(`[upload ${uploadId}] finalize failed:`, e.message);
+    return res.status(500).json({ error: "Failed to finalize upload" });
   }
 
-  persistSession(s);
-
-  // optional: purane client ke liye upload_progress
-  const sock =
-    req.headers["x-socket-id"] &&
-    io.sockets.sockets.get(String(req.headers["x-socket-id"]));
-  if (sock && sock.data?.roomId === roomId) {
-    sock.emit("upload_progress", {
-      uploadId,
-      percent: Math.min(99, Math.floor((s.offset / s.fileSize) * 100)),
-      received: s.offset,
-      total: s.fileSize,
-    });
-  }
+  if (!s.fileEntry) persistSession(s);
   res.json(sessionState(s));
 });
 
