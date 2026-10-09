@@ -11,8 +11,11 @@ const multer = require("multer");
 // require("dotenv").config();
 const app = express();
 const server = http.createServer(app);
+const { pipeline } = require("stream/promises");
 
 server.requestTimeout = 0;
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
 
 function overrideConsole() {
   ["log", "error", "warn", "info", "debug"].forEach((method) => {
@@ -317,6 +320,7 @@ function saveRooms() {
 }
 
 function deleteRoomFiles(roomId) {
+  discardRoomUploads(roomId);
   const roomDir = path.join(FILES_DIR, roomId);
   try {
     if (fs.existsSync(roomDir))
@@ -547,7 +551,9 @@ const corsOptions = {
     "X-File-Name",
     "X-Upload-Id",
     "X-Socket-Id",
+    "X-Upload-Offset",
   ],
+  maxAge: 86400,
 };
 
 app.use(cors(corsOptions));
@@ -555,6 +561,8 @@ app.use(cors(corsOptions));
 app.use(express.json());
 
 const io = new Server(server, {
+  pingInterval: 25_000,
+  pingTimeout: 60_000,
   cors: {
     origin: (origin, callback) => {
       if (!origin || allowedOrigins.includes(origin)) {
@@ -705,6 +713,308 @@ app.post("/api/rooms/my-room", (req, res) => {
   }
 
   res.json({ success: true, room: getRoomPublicData(room) });
+});
+
+const UPLOAD_TMP_DIR = path.join(DATA_DIR, "uploads-tmp");
+fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true });
+
+const DEFAULT_CHUNK_BYTES = 2 * 1024 * 1024;
+const MAX_CHUNK_BYTES = 8 * 1024 * 1024;
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const COMPLETED_KEEP_MS = 10 * 60 * 1000;
+const ID_RE = /^[\w-]{8,64}$/; // uploadId file path mein use hota hai, validate zaroori hai
+
+const uploadSessions = new Map();
+const partPath = (id) => path.join(UPLOAD_TMP_DIR, `${id}.part`);
+const metaPath = (id) => path.join(UPLOAD_TMP_DIR, `${id}.json`);
+
+function persistSession(s) {
+  const { activeReq, fileEntry, ...data } = s;
+  fs.promises
+    .writeFile(metaPath(s.uploadId), JSON.stringify(data))
+    .catch((e) => console.error("persistSession:", e.message));
+}
+
+function sessionState(s) {
+  return {
+    uploadId: s.uploadId,
+    offset: s.offset,
+    fileSize: s.fileSize,
+    chunkSize: DEFAULT_CHUNK_BYTES,
+    complete: !!s.fileEntry,
+    file: s.fileEntry || undefined,
+  };
+}
+
+function discardUpload(uploadId) {
+  const s = uploadSessions.get(uploadId);
+  if (!s) return;
+  s.activeReq?.destroy();
+  uploadSessions.delete(uploadId);
+  fs.promises.unlink(partPath(uploadId)).catch(() => {});
+  fs.promises.unlink(metaPath(uploadId)).catch(() => {});
+}
+
+function discardRoomUploads(roomId) {
+  for (const s of [...uploadSessions.values()]) {
+    if (s.roomId === roomId) discardUpload(s.uploadId);
+  }
+}
+
+// Server restart / deploy ke baad bhi resume ho sake
+(function loadUploadSessions() {
+  const metas = new Set();
+  for (const f of fs.readdirSync(UPLOAD_TMP_DIR)) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      const s = JSON.parse(
+        fs.readFileSync(path.join(UPLOAD_TMP_DIR, f), "utf8"),
+      );
+      if (!fs.existsSync(partPath(s.uploadId))) {
+        fs.unlinkSync(path.join(UPLOAD_TMP_DIR, f));
+        continue;
+      }
+      s.activeReq = null;
+      uploadSessions.set(s.uploadId, s);
+      metas.add(s.uploadId);
+    } catch {
+      /* corrupt meta ignore */
+    }
+  }
+  for (const f of fs.readdirSync(UPLOAD_TMP_DIR)) {
+    // yateem .part files
+    if (f.endsWith(".part") && !metas.has(f.slice(0, -5))) {
+      fs.unlink(path.join(UPLOAD_TMP_DIR, f), () => {});
+    }
+  }
+  console.log(`Restored ${uploadSessions.size} resumable upload session(s)`);
+})();
+
+setInterval(
+  () => {
+    const now = Date.now();
+    for (const s of [...uploadSessions.values()]) {
+      if (!s.fileEntry && now - s.updatedAt > SESSION_TTL_MS)
+        discardUpload(s.uploadId);
+    }
+  },
+  60 * 60 * 1000,
+).unref();
+
+async function finalizeUpload(s, room) {
+  if (room.ended) throw new Error("Room ended");
+  const stat = await fs.promises.stat(partPath(s.uploadId));
+  if (stat.size !== s.fileSize) {
+    throw new Error(`Size mismatch: expected ${s.fileSize}, got ${stat.size}`);
+  }
+  const storedName = `${uuidv4()}${path.extname(s.fileName)}`;
+  const roomDir = path.join(FILES_DIR, room.id);
+  await fs.promises.mkdir(roomDir, { recursive: true });
+  await fs.promises.rename(
+    partPath(s.uploadId),
+    path.join(roomDir, storedName),
+  );
+
+  const fileEntry = {
+    id: path.basename(storedName, path.extname(storedName)),
+    fileName: s.fileName,
+    fileType: s.fileType,
+    fileSize: s.fileSize,
+    storedName,
+    uploadedBy: s.uploaderName,
+    uploaderId: s.uploaderId,
+    uploadedAt: new Date().toISOString(),
+  };
+  room.files.push(fileEntry);
+  saveRooms();
+
+  s.fileEntry = fileEntry; // last response kho jaye to client status se file le sakta hai
+  fs.promises.unlink(metaPath(s.uploadId)).catch(() => {});
+  setTimeout(
+    () => uploadSessions.delete(s.uploadId),
+    COMPLETED_KEEP_MS,
+  ).unref();
+
+  io.to(room.id).emit("file_shared", {
+    file: fileEntry,
+    room: getRoomPublicData(room),
+  });
+  console.log(`File saved (resumable): ${s.fileName} in room ${room.id}`);
+  return fileEntry;
+}
+
+// 1) init (idempotent: same uploadId dobara aaye to current offset milta hai)
+app.post("/api/rooms/:roomId/uploads", (req, res) => {
+  const { roomId } = req.params;
+  const room = rooms.get(roomId);
+  if (!room || room.ended)
+    return res.status(404).json({ error: "Room not found" });
+
+  const {
+    uploadId: requestedId,
+    fileName,
+    fileType,
+    fileSize,
+    uploaderId,
+    uploaderName,
+  } = req.body || {};
+  const size = Number(fileSize);
+  if (!fileName || !Number.isFinite(size) || size <= 0) {
+    return res.status(400).json({ error: "fileName and fileSize required" });
+  }
+  if (size > MAX_FILE_BYTES) {
+    return res.status(413).json({
+      error: `File too large (max ${Math.floor(MAX_FILE_BYTES / 1048576)} MB)`,
+    });
+  }
+  if (requestedId !== undefined && !ID_RE.test(String(requestedId))) {
+    return res.status(400).json({ error: "Invalid uploadId" });
+  }
+
+  touchRoom(roomId);
+
+  const existing = requestedId && uploadSessions.get(requestedId);
+  if (
+    existing &&
+    existing.roomId === roomId &&
+    existing.fileName === fileName &&
+    existing.fileSize === size
+  ) {
+    return res.json(sessionState(existing));
+  }
+
+  const uploadId = requestedId && !existing ? requestedId : uuidv4();
+  const s = {
+    uploadId,
+    roomId,
+    fileName,
+    fileSize: size,
+    fileType: fileType || "application/octet-stream",
+    uploaderId: uploaderId || "unknown",
+    uploaderName: uploaderName || "Unknown",
+    offset: 0,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    activeReq: null,
+  };
+  fs.closeSync(fs.openSync(partPath(uploadId), "w"));
+  uploadSessions.set(uploadId, s);
+  persistSession(s);
+  res.status(201).json(sessionState(s));
+});
+
+// 2) status: client reconnect ke baad yahin se exact offset poochta hai
+app.get("/api/rooms/:roomId/uploads/:uploadId", (req, res) => {
+  const s = uploadSessions.get(req.params.uploadId);
+  if (!s || s.roomId !== req.params.roomId) {
+    return res.status(404).json({ error: "Upload session not found" });
+  }
+  touchRoom(s.roomId);
+  res.json(sessionState(s));
+});
+
+// 3) chunk
+app.put("/api/rooms/:roomId/uploads/:uploadId", async (req, res) => {
+  const { roomId, uploadId } = req.params;
+  const room = rooms.get(roomId);
+  const s = uploadSessions.get(uploadId);
+  if (!room || room.ended || !s || s.roomId !== roomId) {
+    req.resume();
+    return res.status(404).json({ error: "Upload session not found" });
+  }
+  if (s.fileEntry) {
+    req.resume();
+    return res.json(sessionState(s));
+  } // already complete
+
+  const start = Number(req.headers["x-upload-offset"]);
+  const len = Number(req.headers["content-length"]);
+  if (!Number.isInteger(start) || !Number.isInteger(len) || len <= 0) {
+    req.resume();
+    return res
+      .status(400)
+      .json({ error: "X-Upload-Offset and Content-Length required" });
+  }
+  if (len > MAX_CHUNK_BYTES) {
+    req.resume();
+    return res.status(413).json({ error: "Chunk too large" });
+  }
+  if (start !== s.offset) {
+    req.resume();
+    return res.status(409).json(sessionState(s));
+  }
+  if (start + len > s.fileSize) {
+    req.resume();
+    return res.status(400).json({ error: "Chunk exceeds file size" });
+  }
+
+  // Network drop ke baad purani request server pe "zinda" reh sakti hai (TCP timeout tak).
+  // Nayi request aaye to purani ko foran khatam karo. Dono same bytes same position pe
+  // likhte hain, is liye overlap se data kharab nahi hota.
+  if (s.activeReq && !s.activeReq.destroyed) s.activeReq.destroy();
+  s.activeReq = req;
+
+  const ws = fs.createWriteStream(partPath(uploadId), { flags: "r+", start });
+  let written = 0;
+  req.on("data", (c) => {
+    written += c.length;
+  });
+
+  try {
+    await pipeline(req, ws);
+  } catch (err) {
+    // Offset aage nahi barha. Client wahi chunk dobara bhejega.
+    console.warn(
+      `[upload ${uploadId}] chunk @${start} interrupted at ${written}/${len} (${err.code || err.message})`,
+    );
+    if (s.activeReq === req) s.activeReq = null;
+    return;
+  }
+  if (s.activeReq !== req) return; // koi nayi request isay replace kar chuki hai
+  s.activeReq = null;
+
+  if (written !== len) {
+    return res
+      .status(400)
+      .json({ error: "Chunk size mismatch", ...sessionState(s) });
+  }
+
+  s.offset = start + len;
+  s.updatedAt = Date.now();
+  touchRoom(roomId);
+
+  if (s.offset === s.fileSize) {
+    try {
+      await finalizeUpload(s, room);
+    } catch (e) {
+      console.error(`[upload ${uploadId}] finalize failed:`, e.message);
+      return res.status(500).json({ error: "Failed to finalize upload" });
+    }
+    return res.json(sessionState(s));
+  }
+
+  persistSession(s);
+
+  // optional: purane client ke liye upload_progress
+  const sock =
+    req.headers["x-socket-id"] &&
+    io.sockets.sockets.get(String(req.headers["x-socket-id"]));
+  if (sock && sock.data?.roomId === roomId) {
+    sock.emit("upload_progress", {
+      uploadId,
+      percent: Math.min(99, Math.floor((s.offset / s.fileSize) * 100)),
+      received: s.offset,
+      total: s.fileSize,
+    });
+  }
+  res.json(sessionState(s));
+});
+
+// 4) cancel
+app.delete("/api/rooms/:roomId/uploads/:uploadId", (req, res) => {
+  const s = uploadSessions.get(req.params.uploadId);
+  if (s && s.roomId === req.params.roomId) discardUpload(s.uploadId);
+  res.json({ success: true });
 });
 
 // ─── REST: Upload file ────────────────────────────────────
