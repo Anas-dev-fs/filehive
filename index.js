@@ -457,6 +457,8 @@ function trackUploadProgress(req, res, next) {
   let lastPercent = -1;
   let lastEmitAt = 0;
   let lastLoggedStep = -1;
+  const startedAt = Date.now();
+  let lastChunkAt = Date.now();
 
   const emitProgress = () => {
     const percent = totalBytes
@@ -509,7 +511,9 @@ function trackUploadProgress(req, res, next) {
     );
   });
   req.on("error", (e) => {
-    console.log(`[${fileName}] req error: ${e.code} ${e.message}`); // ECONNRESET etc.
+    console.log(
+      `[${fileName}] req error: name=${e.name} code=${e.code} msg=${e.message}`,
+    );
   });
 
   req.on("close", () => {
