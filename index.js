@@ -931,6 +931,11 @@ app.get("/api/rooms/:roomId/uploads/:uploadId", (req, res) => {
     return res.status(404).json({ error: "Upload session not found" });
   }
   touchRoom(s.roomId);
+  console.log(
+    `[${s.fileName}] [Room: ${room.name} (${roomId})] ` +
+      `${(s.offset / 1048576).toFixed(2)} MB / ${(s.fileSize / 1048576).toFixed(2)} MB ` +
+      `(${Math.floor((s.offset / s.fileSize) * 100)}%)`,
+  );
   res.json(sessionState(s));
 });
 
