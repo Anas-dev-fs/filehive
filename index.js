@@ -367,6 +367,9 @@ function uploadSingle(req, res, next) {
   upload.single("file")(req, res, (err) => {
     if (!err) return next();
 
+    console.log("req destroyed:", req.destroyed);
+    console.log("req aborted:", req.aborted);
+
     // Client cancelled the upload (xhr.abort / closed tab / network drop)
     if (err.message === "Request aborted" || req.aborted || req.destroyed) {
       console.log(`Upload cancelled by client: room ${req.params.roomId}`);
@@ -498,9 +501,21 @@ function trackUploadProgress(req, res, next) {
   });
 
   req.on("aborted", () => {
-    console.log(`[${fileName}] upload aborted at ${receivedBytes} bytes`);
+    console.log(
+      `[${fileName}] ABORTED ${receivedBytes}/${totalBytes} bytes | ` +
+        `elapsed ${((Date.now() - startedAt) / 1000).toFixed(1)}s | ` +
+        `idle before abort ${Date.now() - lastChunkAt}ms | ` +
+        `socketDestroyed=${req.socket.destroyed}`,
+    );
+  });
+  req.on("error", (e) => {
+    console.log(`[${fileName}] req error: ${e.code} ${e.message}`); // ECONNRESET etc.
   });
 
+  req.on("close", () => {
+    if (!req.complete)
+      console.log(`[${fileName}] connection closed before upload completed`);
+  });
   next();
 }
 
